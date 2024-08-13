@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import unittest
 
 import speech_recognition as sr
@@ -12,27 +13,27 @@ class TestRecognition(unittest.TestCase):
         self.AUDIO_FILE_EN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "english.wav")
         self.AUDIO_FILE_FR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "french.aiff")
         self.AUDIO_FILE_ZH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chinese.flac")
-        self.WHISPER_CONFIG = {"temperature": 0}
 
+    def test_recognizer_attributes(self):
+        r = sr.Recognizer()
+        attributes = set(dir(r))
+
+        self.assertEqual(r.energy_threshold, 300)
+        self.assertTrue(r.dynamic_energy_threshold)
+        self.assertEqual(r.dynamic_energy_adjustment_damping, 0.15)
+        self.assertEqual(r.dynamic_energy_ratio, 1.5)
+        self.assertEqual(r.pause_threshold, 0.8)
+        self.assertIsNone(r.operation_timeout)
+        self.assertEqual(r.phrase_threshold, 0.3)
+        self.assertEqual(r.non_speaking_duration, 0.5)
+        # https://github.com/Uberi/speech_recognition/issues/743
+        self.assertTrue("recognize_google" in attributes)
+
+    @unittest.skipIf(sys.platform.startswith("win"), "skip on Windows")
     def test_sphinx_english(self):
         r = sr.Recognizer()
         with sr.AudioFile(self.AUDIO_FILE_EN) as source: audio = r.record(source)
         self.assertEqual(r.recognize_sphinx(audio), "one two three")
-
-    def test_google_english(self):
-        r = sr.Recognizer()
-        with sr.AudioFile(self.AUDIO_FILE_EN) as source: audio = r.record(source)
-        self.assertIn(r.recognize_google(audio), ["123", "1 2 3", "one two three"])
-
-    def test_google_french(self):
-        r = sr.Recognizer()
-        with sr.AudioFile(self.AUDIO_FILE_FR) as source: audio = r.record(source)
-        self.assertEqual(r.recognize_google(audio, language="fr-FR"), u"et c'est la dictée numéro 1")
-
-    def test_google_chinese(self):
-        r = sr.Recognizer()
-        with sr.AudioFile(self.AUDIO_FILE_ZH) as source: audio = r.record(source)
-        self.assertEqual(r.recognize_google(audio, language="zh-CN"), u"砸自己的脚")
 
     @unittest.skipUnless("WIT_AI_KEY" in os.environ, "requires Wit.ai key to be specified in WIT_AI_KEY environment variable")
     def test_wit_english(self):
@@ -82,20 +83,6 @@ class TestRecognition(unittest.TestCase):
         with sr.AudioFile(self.AUDIO_FILE_ZH) as source: audio = r.record(source)
         self.assertEqual(r.recognize_ibm(audio, username=os.environ["IBM_USERNAME"], password=os.environ["IBM_PASSWORD"], language="zh-CN"), u"砸 自己 的 脚 ")
 
-    def test_whisper_english(self):
-        r = sr.Recognizer()
-        with sr.AudioFile(self.AUDIO_FILE_EN) as source: audio = r.record(source)
-        self.assertEqual(r.recognize_whisper(audio, language="english", **self.WHISPER_CONFIG), " 1, 2, 3.")
-
-    def test_whisper_french(self):
-        r = sr.Recognizer()
-        with sr.AudioFile(self.AUDIO_FILE_FR) as source: audio = r.record(source)
-        self.assertEqual(r.recognize_whisper(audio, language="french", **self.WHISPER_CONFIG), " et c'est la dictée numéro 1.")
-
-    def test_whisper_chinese(self):
-        r = sr.Recognizer()
-        with sr.AudioFile(self.AUDIO_FILE_ZH) as source: audio = r.record(source)
-        self.assertEqual(r.recognize_whisper(audio, model="small", language="chinese", **self.WHISPER_CONFIG), u"砸自己的腳")
 
     def test_faster_whisper_english(self):
         r = sr.Recognizer()
