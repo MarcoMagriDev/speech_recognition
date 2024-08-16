@@ -25,6 +25,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import numpy as np
+
 try:
     import requests
 except (ModuleNotFoundError, ImportError):
@@ -446,8 +448,72 @@ class Recognizer(AudioSource):
                 last_check = time.time()
 
         return b"".join(frames), elapsed_time
+   
+    def efficient_word_net_wait_for_hot_word(self, detector, source, timeout=None):
+        def save_wav(filename, data, sample_rate, sample_width):
+            """
+            Save audio data to a WAV file.
+            
+            :param filename: The filename to save the WAV file.
+            :param data: The audio data as bytes.
+            :param sample_rate: The sample rate of the audio data.
+            :param sample_width: The sample width of the audio data.
+            """
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(1)  # Mono audio
+                wf.setsampwidth(sample_width)
+                wf.setframerate(sample_rate)
+                wf.writeframes(data)
+        """
+        Waits for the hotword to be detected using the efficient_word_net HotwordDetector.
 
-    def listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, stream=False):
+        :param detector: An instance of HotwordDetector from eff_word_net
+        :param source: The audio source object, which provides audio chunks to be analyzed
+        :param timeout: Maximum time to wait for the hotword to be detected
+        :return: Audio data that contains the hotword and the elapsed time until detection
+        """
+        
+        elapsed_time = 0
+        seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
+
+        efficient_word_net_sample_rate = 16000  # Assuming this is the required sample rate for the model
+        required_samples = detector.model.window_frames  # Number of frames expected by the model
+        
+        # Buffers to store audio data
+        frames = collections.deque(maxlen=math.ceil(5 / seconds_per_buffer))
+        resampled_frames = collections.deque(maxlen=math.ceil(1.5 * efficient_word_net_sample_rate))
+        
+        resampling_state = None
+
+        while True:
+            elapsed_time += seconds_per_buffer
+            if timeout and elapsed_time > timeout:
+                raise WaitTimeoutError("Listening timed out while waiting for hotword to be detected.")
+            
+            buffer = source.stream.read(source.CHUNK)
+            if len(buffer) == 0:
+                break  # reached the end of the stream
+            frames.append(buffer)
+
+            # Resample the audio buffer to the required sample rate
+            resampled_buffer, resampling_state = audioop.ratecv(buffer, source.SAMPLE_WIDTH, 1, source.SAMPLE_RATE, efficient_word_net_sample_rate, resampling_state)
+            resampled_frames.extend(np.frombuffer(resampled_buffer, dtype=np.int16))
+
+            # Save resampled audio data (use the efficient_word_net_sample_rate)
+            if len(resampled_frames) >= required_samples:
+                audio_as_np = np.array(resampled_frames)[:required_samples]
+                # Pass the normalized and correctly shaped audio data to the HotwordDetector
+                score_result = detector.scoreFrame(audio_as_np)
+                resampled_frames.clear()  # Clear frames after each detection attempt
+
+                if score_result is not None and score_result["match"]:
+                    print(f"Wakeword detected with confidence {score_result['confidence']}")
+                    break
+
+        # Return the raw audio data that was processed and the time taken to detect the hotword
+        return b"".join(frames), elapsed_time
+
+    def listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, efficient_wordnet_detector=None, stream=False):
         """
         Records a single phrase from ``source`` (an ``AudioSource`` instance) into an ``AudioData`` instance, which it returns.
 
@@ -463,13 +529,13 @@ class Recognizer(AudioSource):
 
         This operation will always complete within ``timeout + phrase_timeout`` seconds if both are numbers, either by returning the audio data, or by raising a ``speech_recognition.WaitTimeoutError`` exception.
         """
-        result = self._listen(source, timeout, phrase_time_limit, snowboy_configuration, stream)
+        result = self._listen(source, timeout, phrase_time_limit, snowboy_configuration, efficient_wordnet_detector, stream)
         if not stream:
             for a in result:
                 return a
         return result
 
-    def _listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, stream=False):
+    def _listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, efficient_wordnet_detector=None, stream=False):
         assert isinstance(source, AudioSource), "Source must be an audio source"
         assert source.stream is not None, "Audio source must be entered before listening, see documentation for ``AudioSource``; are you using ``source`` outside of a ``with`` statement?"
         assert self.pause_threshold >= self.non_speaking_duration >= 0
@@ -491,27 +557,33 @@ class Recognizer(AudioSource):
 
             if snowboy_configuration is None:
                 # store audio input until the phrase starts
-                while True:
-                    # handle waiting too long for phrase by raising an exception
-                    elapsed_time += seconds_per_buffer
-                    if timeout and elapsed_time > timeout:
-                        raise WaitTimeoutError("listening timed out while waiting for phrase to start")
+                if efficient_wordnet_detector is None:
+                    while True:
+                        # handle waiting too long for phrase by raising an exception
+                        elapsed_time += seconds_per_buffer
+                        if timeout and elapsed_time > timeout:
+                            raise WaitTimeoutError("listening timed out while waiting for phrase to start")
 
-                    buffer = source.stream.read(source.CHUNK)
+                        buffer = source.stream.read(source.CHUNK)
+                        if len(buffer) == 0: break  # reached end of the stream
+                        frames.append(buffer)
+                        if len(frames) > non_speaking_buffer_count:  # ensure we only keep the needed amount of non-speaking buffers
+                            frames.popleft()
+
+                        # detect whether speaking has started on audio input
+                        energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # energy of the audio signal
+                        if energy > self.energy_threshold: break
+
+                        # dynamically adjust the energy threshold using asymmetric weighted average
+                        if self.dynamic_energy_threshold:
+                            damping = self.dynamic_energy_adjustment_damping ** seconds_per_buffer  # account for different chunk sizes and rates
+                            target_energy = energy * self.dynamic_energy_ratio
+                            self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
+                else:
+                    buffer, delta_time = self.efficient_word_net_wait_for_hot_word(efficient_wordnet_detector, source, timeout)
+                    elapsed_time += delta_time
                     if len(buffer) == 0: break  # reached end of the stream
                     frames.append(buffer)
-                    if len(frames) > non_speaking_buffer_count:  # ensure we only keep the needed amount of non-speaking buffers
-                        frames.popleft()
-
-                    # detect whether speaking has started on audio input
-                    energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # energy of the audio signal
-                    if energy > self.energy_threshold: break
-
-                    # dynamically adjust the energy threshold using asymmetric weighted average
-                    if self.dynamic_energy_threshold:
-                        damping = self.dynamic_energy_adjustment_damping ** seconds_per_buffer  # account for different chunk sizes and rates
-                        target_energy = energy * self.dynamic_energy_ratio
-                        self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
             else:
                 # read audio input until the hotword is said
                 snowboy_location, snowboy_hot_word_files = snowboy_configuration
